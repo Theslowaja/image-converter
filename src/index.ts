@@ -3,7 +3,7 @@ import { qoiEncode } from "./qoi";
 import { encodeAndCompress } from "./compress";
 
 export interface Env {
-  // Bindings or environment variables can be added here
+  // Bindings or environment variables
 }
 
 function corsHeaders(): HeadersInit {
@@ -12,6 +12,25 @@ function corsHeaders(): HeadersInit {
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Accept, Authorization, X-Use-OpenCV"
   };
+}
+
+async function fetchImageFromUrl(imageUrl: string): Promise<{ buffer: ArrayBuffer; filename: string }> {
+  const parsed = new URL(imageUrl);
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error("Invalid image URL protocol. Only http and https allowed.");
+  }
+  const res = await fetch(imageUrl, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VeloverImageWorker/1.0"
+    }
+  });
+  if (!res.ok) {
+    throw new Error(`Failed to download image from URL (${res.status} ${res.statusText})`);
+  }
+  const buffer = await res.arrayBuffer();
+  const pathParts = parsed.pathname.split("/");
+  const filename = pathParts[pathParts.length - 1] || "image";
+  return { buffer, filename };
 }
 
 export default {
@@ -23,21 +42,19 @@ export default {
       return new Response(null, { headers: corsHeaders() });
     }
 
-    // Health / Documentation route
-    if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
+    // Health / info
+    if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health") && !url.searchParams.has("url")) {
       return new Response(
         JSON.stringify({
           name: "velover-image-extractor-worker",
-          version: "1.0.0",
+          version: "1.1.0",
           description: "Cloudflare Worker port of Velover Template (Image -> QOI -> Base64 -> Deflate -> Base64)",
           usage: {
-            method: "POST",
-            path: "/convert",
-            bodyTypes: [
-              "multipart/form-data (field: 'image' or 'file')",
-              "image/png, image/jpeg, application/octet-stream (raw binary body)",
-              "application/json ({ imageBase64: '...' })"
-            ]
+            viaUrlGet: "GET /convert?url=https://example.com/image.png",
+            viaUrlPost: "POST /convert with JSON { url: 'https://example.com/image.png' }",
+            viaFileUpload: "POST /convert with multipart/form-data (field: 'image' or 'file')",
+            viaRawBinary: "POST /convert with image/png or image/jpeg binary body",
+            viaBase64: "POST /convert with JSON { imageBase64: '...' }"
           }
         }, null, 2),
         {
@@ -49,8 +66,9 @@ export default {
       );
     }
 
-    if (request.method !== "POST") {
-      return new Response(JSON.stringify({ error: "Method not allowed. Use POST /convert" }), {
+    // Support both GET (with ?url=...) and POST
+    if (request.method !== "POST" && request.method !== "GET") {
+      return new Response(JSON.stringify({ error: "Method not allowed. Use GET with ?url= or POST /convert" }), {
         status: 405,
         headers: { "Content-Type": "application/json", ...corsHeaders() }
       });
@@ -62,7 +80,15 @@ export default {
       let imageBuffer: ArrayBuffer | null = null;
       let filename = "image";
 
-      if (contentType.includes("multipart/form-data")) {
+      const queryUrl = url.searchParams.get("url");
+
+      if (queryUrl) {
+        // Source 1: GET /convert?url=https://...
+        const downloaded = await fetchImageFromUrl(queryUrl);
+        imageBuffer = downloaded.buffer;
+        filename = downloaded.filename;
+      } else if (contentType.includes("multipart/form-data")) {
+        // Source 2: Multipart form upload
         const formData = await request.formData();
         const file = formData.get("image") || formData.get("file");
         if (!file || typeof file === "string") {
@@ -74,29 +100,33 @@ export default {
         filename = (file as File).name || "image";
         imageBuffer = await (file as File).arrayBuffer();
       } else if (contentType.includes("application/json")) {
-        const body = (await request.json()) as { imageBase64?: string; name?: string };
-        if (!body.imageBase64) {
-          return new Response(JSON.stringify({ error: "Missing 'imageBase64' field in JSON body" }), {
+        // Source 3: JSON body (url or base64)
+        const body = (await request.json()) as { url?: string; imageBase64?: string; name?: string };
+        if (body.url) {
+          const downloaded = await fetchImageFromUrl(body.url);
+          imageBuffer = downloaded.buffer;
+          filename = body.name || downloaded.filename;
+        } else if (body.imageBase64) {
+          if (body.name) filename = body.name;
+          const cleanBase64 = body.imageBase64.replace(/^data:image\/\w+;base64,/, "");
+          const binaryStr = atob(cleanBase64);
+          const len = binaryStr.length;
+          const bytes = new Uint8Array(len);
+          for (let i = 0; i < len; i++) {
+            bytes[i] = binaryStr.charCodeAt(i);
+          }
+          imageBuffer = bytes.buffer;
+        } else {
+          return new Response(JSON.stringify({ error: "JSON body must contain 'url' or 'imageBase64'" }), {
             status: 400,
             headers: { "Content-Type": "application/json", ...corsHeaders() }
           });
         }
-        if (body.name) filename = body.name;
-
-        // Clean base64 data uri prefix if present
-        const cleanBase64 = body.imageBase64.replace(/^data:image\/\w+;base64,/, "");
-        const binaryStr = atob(cleanBase64);
-        const len = binaryStr.length;
-        const bytes = new Uint8Array(len);
-        for (let i = 0; i < len; i++) {
-          bytes[i] = binaryStr.charCodeAt(i);
-        }
-        imageBuffer = bytes.buffer;
       } else {
-        // Raw binary body (image/png, image/jpeg, application/octet-stream)
+        // Source 4: Raw binary body
         imageBuffer = await request.arrayBuffer();
         if (!imageBuffer || imageBuffer.byteLength === 0) {
-          return new Response(JSON.stringify({ error: "Empty request body" }), {
+          return new Response(JSON.stringify({ error: "Empty request body or missing ?url= parameter" }), {
             status: 400,
             headers: { "Content-Type": "application/json", ...corsHeaders() }
           });
